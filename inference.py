@@ -1,140 +1,147 @@
 import asyncio
 import os
 import time
-from openai import OpenAI
+from typing import List, Optional
+
 import requests
+from openai import OpenAI
 
-# ENV CONFIG :-
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
+HF_TOKEN     = os.getenv("HF_TOKEN")
 
-try:
-    API_BASE_URL = os.environ["API_BASE_URL"]
-    API_KEY = os.environ["API_KEY"]
-except KeyError as e:
-    print(f"[FATAL] Missing required env var: {str(e)}", flush=True)
+ENV_URL = os.getenv("ENV_URL", "http://localhost:7860")
+
+API_KEY = HF_TOKEN or os.getenv("API_KEY")
+
+if not API_KEY:
+    print("[FATAL] Neither HF_TOKEN nor API_KEY is set", flush=True)
     exit(1)
 
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-ENV_URL = os.environ.get("ENV_URL", "http://localhost:7860")
+TASK_NAME  = "customer-support"
+BENCHMARK  = "customer-support-env"
+MAX_STEPS  = 5
+SUCCESS_THRESHOLD = 2.0
 
 print(f"[CONFIG] API_BASE_URL={API_BASE_URL} MODEL={MODEL_NAME} ENV_URL={ENV_URL}", flush=True)
 
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
 
-# LOGGING :-
-
-def log_start():
-    print(f"[START] task=customer-support env=custom model={MODEL_NAME}", flush=True)
-
-
-def log_step(step, action, reward, done):
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val    = error if error else "null"
+    action_clean = action.replace("\n", " ").replace("\r", "")[:120]
     print(
-        f"[STEP] step={step} action={action[:80]} reward={reward:.2f} done={str(done).lower()} error=null",
-        flush=True
+        f"[STEP] step={step} action={action_clean} reward={reward:.2f} "
+        f"done={str(done).lower()} error={error_val}",
+        flush=True,
     )
 
-
-def log_end(success, steps, rewards):
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    print(f"[END] success={str(success).lower()} steps={steps} rewards={rewards_str}", flush=True)
+    print(
+        f"[END] success={str(success).lower()} steps={steps} "
+        f"score={score:.3f} rewards={rewards_str}",
+        flush=True,
+    )
 
-
-# WAIT FOR ENV TO BE READY :-
-
-def wait_for_env(url, retries=10, delay=3):
+def wait_for_env(url: str, retries: int = 15, delay: int = 3) -> bool:
     for attempt in range(1, retries + 1):
         try:
             r = requests.get(f"{url}/", timeout=5)
             if r.status_code == 200:
                 print(f"[ENV] Ready after {attempt} attempt(s)", flush=True)
                 return True
-        except Exception as e:
-            print(f"[ENV] Attempt {attempt}/{retries} failed: {e}", flush=True)
+        except Exception as exc:
+            print(f"[ENV] Attempt {attempt}/{retries}: {exc}", flush=True)
         time.sleep(delay)
     return False
 
+SYSTEM_PROMPT = (
+    "You are a helpful and empathetic customer support agent. "
+    "Always acknowledge the customer's frustration, then provide a clear specific resolution. "
+    "Be concise (under 150 words)."
+)
 
-# LLM RESPONSE :-
-
-def get_response(query, history):
-    client = OpenAI(
-        base_url=API_BASE_URL,
-        api_key=API_KEY
-    )
-
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a helpful and empathetic customer support agent."
-        }
-    ]
+def get_response(client: OpenAI, query: str, history: list, intent: str) -> str:
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     for h in history:
-        messages.append({"role": "user", "content": h["user"]})
+        messages.append({"role": "user",      "content": h["user"]})
         messages.append({"role": "assistant", "content": h["agent"]})
 
     messages.append({"role": "user", "content": query})
 
-    print(f"[LLM_CALL] Calling {API_BASE_URL} model={MODEL_NAME}", flush=True)
+    print(f"[LLM_CALL] model={MODEL_NAME} intent={intent}", flush=True)
 
-    try:
-        completion = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            max_tokens=150
-        )
-        response = completion.choices[0].message.content.strip()
-        print(f"[LLM_OK] {response[:80]}", flush=True)
-        return response
+    completion = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        max_tokens=150,
+        temperature=0.7,
+    )
 
-    except Exception as e:
-        print(f"[LLM_ERROR] type={type(e).__name__} msg={str(e)}", flush=True)
-        # Re-raise so the validator sees the real failure rather than
-        # silently returning a hardcoded response that bypasses the proxy.
-        raise
+    text = (completion.choices[0].message.content or "").strip()
+    print(f"[LLM_OK] {text[:80]}", flush=True)
+    return text
 
+async def main() -> None:
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-async def main():
-    log_start()
+    rewards:     List[float] = []
+    steps_taken: int         = 0
+    score:       float       = 0.0
+    success:     bool        = False
 
-    # Wait for env server to be ready (Docker/HF Space cold-start)
+    log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
+
     if not wait_for_env(ENV_URL):
-        print(f"[FATAL] Env server not reachable at {ENV_URL} after retries", flush=True)
+        print(f"[FATAL] Env server not reachable at {ENV_URL}", flush=True)
+        log_end(success=False, steps=0, score=0.0, rewards=[])
         exit(1)
 
-    # RESET
-    res = requests.post(f"{ENV_URL}/reset", timeout=20)
-    res.raise_for_status()
-    result = res.json()
-
-    rewards = []
-    step = 0
-
-    for step in range(1, 6):
-        obs = result["observation"]
-        query = obs["user_query"]
-        history = obs["conversation_history"]
-
-        response = get_response(query, history)
-
-        res = requests.post(
-            f"{ENV_URL}/step",
-            json={"response": response},
-            timeout=20
-        )
+    try:
+        res = requests.post(f"{ENV_URL}/reset", timeout=20)
         res.raise_for_status()
         result = res.json()
 
-        reward = result["reward"]
-        done = result["done"]
+        for step in range(1, MAX_STEPS + 1):
+            obs     = result["observation"]
+            query   = obs["user_query"]
+            history = obs["conversation_history"]
+            intent  = obs.get("intent", "general")
 
-        rewards.append(reward)
-        log_step(step, response, reward, done)
+            response = get_response(client, query, history, intent)
 
-        if done:
-            break
+            step_res = requests.post(
+                f"{ENV_URL}/step",
+                json={"response": response},
+                timeout=20,
+            )
+            step_res.raise_for_status()
+            result = step_res.json()
 
-    success = sum(rewards) > 2.0
-    log_end(success, step, rewards)
+            reward = float(result["reward"])
+            done   = bool(result["done"])
 
+            rewards.append(reward)
+            steps_taken = step
+
+            log_step(step=step, action=response, reward=reward, done=done, error=None)
+
+            if done:
+                break
+
+        total   = sum(rewards)
+        score   = round(min(max(total / MAX_STEPS, 0.001), 0.999), 3)
+        success = total >= SUCCESS_THRESHOLD
+
+    except Exception as exc:
+        print(f"[FATAL] {type(exc).__name__}: {exc}", flush=True)
+        raise
+
+    finally:
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
 if __name__ == "__main__":
     asyncio.run(main())
